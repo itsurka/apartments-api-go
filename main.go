@@ -4,6 +4,7 @@ import (
 	json2 "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/streadway/amqp"
 	"io"
@@ -35,6 +36,7 @@ func runWebServer() {
 	http.HandleFunc("/ping", ping)
 	http.HandleFunc("/apartments", getApartmentsRequest)
 	http.HandleFunc("/apartments/import", handleImportApartmentsRequest)
+	http.HandleFunc("/websocket/message/send", sendWebsocketMessage)
 
 	err := http.ListenAndServe(":8000", nil)
 	if errors.Is(err, http.ErrServerClosed) {
@@ -407,4 +409,43 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 	}
 
 	return days, datasets
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
+var wsConn = websocket.Conn{}
+
+type WebsocketMessage struct {
+	Event string
+	//Version string
+	//Data interface{}
+}
+
+func sendWebsocketMessage(wr http.ResponseWriter, request *http.Request) {
+	conn, err := upgrader.Upgrade(wr, request, nil)
+	eh.FailOnError(err)
+
+	messageType, _, err := conn.NextReader()
+	eh.FailOnError(err)
+	w, err := conn.NextWriter(messageType)
+	eh.FailOnError(err)
+
+	messageDataBytes, err := json2.Marshal(WebsocketMessage{
+		Event: "test",
+	})
+	eh.FailOnError(err)
+
+	_, wsWriteErr := w.Write(messageDataBytes)
+	eh.FailOnError(wsWriteErr)
+
+	json, jsonErr := json2.Marshal(ApiResponse{
+		Success: true,
+	})
+	eh.FailOnError(jsonErr)
+
+	_, writeErr := io.WriteString(wr, string(json))
+	eh.FailOnError(writeErr)
 }
