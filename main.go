@@ -4,22 +4,41 @@ import (
 	json2 "encoding/json"
 	"errors"
 	"fmt"
+	"github.com/joho/godotenv"
+	"github.com/streadway/amqp"
 	"io"
 	"itsurka/apartments-api/internal/dto"
 	"itsurka/apartments-api/internal/helpers/dbhelper"
+	eh "itsurka/apartments-api/internal/helpers/errhelper"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
 
+/**
+Rest API
+- GET http://localhost:8000/ping
+- GET http://localhost:8000/apartments
+- POST http://localhost:8000/apartments/import
+*/
+
 func main() {
+	runWebServer()
+	//apartments := getApartments(nil)
+	//groupedApartments := groupApartmentsByUrl(apartments)
+	//days, datasets := getChartData(groupedApartments)
+	//fmt.Println(days, datasets)
+}
+
+func runWebServer() {
 	http.HandleFunc("/ping", ping)
-
 	http.HandleFunc("/apartments", getApartmentsRequest)
+	http.HandleFunc("/apartments/import", handleImportApartmentsRequest)
 
-	err := http.ListenAndServe(":3333", nil)
+	err := http.ListenAndServe(":8000", nil)
 	if errors.Is(err, http.ErrServerClosed) {
+
 		fmt.Println("server closed")
 	} else if err != nil {
 		fmt.Printf("error starting server: %s\n", err)
@@ -30,29 +49,80 @@ func main() {
 }
 
 func ping(wr http.ResponseWriter, request *http.Request) {
-	io.WriteString(wr, "pong!")
+	_, err := io.WriteString(wr, "pong!")
+	if err != nil {
+		panic(err)
+	}
 }
 
-func getApartments() []dto.Apartment {
+func getApartments(request *http.Request) []dto.Apartment {
+	err := godotenv.Load(".env")
+	eh.FailOnError(err)
+
 	dbConfig := dbhelper.DbConfig{
-		"postgres",
-		"localhost",
-		5432,
-		"test",
-		"test",
-		"go_web_parser",
+		os.Getenv("DB_DRIVER"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_NAME"),
 	}
 	db := dbhelper.GetConnection(dbConfig)
 
-	var apartmentsCount int
-	countErr := db.QueryRow("SELECT COUNT(id) FROM apartments").Scan(&apartmentsCount)
-	if countErr != nil {
-		panic(countErr)
-	}
-	//const apartmentsCount2 = apartmentsCount
-	// @todo defer close?
+	querySelect := "SELECT id,url,title,description,price_eur,price_usd,price_leu,price_square_meter_eur,location," +
+		"last_updated,page_views,seller_login,seller_phone,image_urls,to_char(created_at, 'YYYY-MM-DD') " +
+		"as created_at,updated_at,unavailable_from "
+	var query string
+	var countQuery string
 
-	rows, err := db.Query("SELECT id,url,title,description,price_eur,price_usd,price_leu,price_square_meter_eur,location,last_updated,page_views,seller_login,seller_phone,image_urls,to_char(created_at, 'YYYY-MM-DD') as created_at,updated_at,unavailable_from FROM apartments ORDER BY id ASC")
+	priceChangerDirection := request.URL.Query().Get("price_changed")
+	// @todo remove!
+	//priceChangerDirection := "down"
+
+	switch priceChangerDirection {
+	case "down", "up":
+		var sign string
+		if priceChangerDirection == "down" {
+			sign = "<"
+		} else {
+			sign = ">"
+		}
+
+		query = querySelect +
+			"from apartments " +
+			"where url IN (select distinct t.url" +
+			"              from apartments t" +
+			"              where t.url IN (select url" +
+			"                              from (select price_eur," +
+			"                                           lag(price_eur) over (order by created_at asc) as prev_price_eur," +
+			"                                           url" +
+			"                                    from ((select id, url, price_eur, created_at" +
+			"                                           from apartments" +
+			"                                           where price_eur > 0 and url = t.url" +
+			"                                           order by created_at asc limit 1)" +
+			"                                          UNION ALL" +
+			"                                          (select id, url, price_eur, created_at" +
+			"                                           from apartments" +
+			"                                           where price_eur > 0 and url = t.url" +
+			"                                           order by created_at desc limit 1)) t3) t2" +
+			"                              where t.price_eur " + sign + " t2.prev_price_eur and t2.prev_price_eur > 0)) " +
+			"ORDER BY id ASC"
+
+		countQuery = "SELECT COUNT(sq.id) FROM (" + query + ") sq"
+
+	default:
+		query = querySelect +
+			"FROM apartments " +
+			"ORDER BY id ASC"
+
+		countQuery = "SELECT COUNT(id) FROM apartments"
+	}
+
+	var apartmentsCount int
+	countErr := db.QueryRow(countQuery).Scan(&apartmentsCount)
+	eh.FailOnError(countErr)
+
+	rows, err := db.Query(query)
 	if err != nil {
 		panic(err)
 	}
@@ -136,7 +206,7 @@ func getApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
 	wr.Header().Set("Access-Control-Allow-Origin", "*")
 	wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	apartments := getApartments()
+	apartments := getApartments(request)
 	groupedApartments := groupApartmentsByUrl(apartments)
 	days, datasets := getChartData(groupedApartments)
 
@@ -149,14 +219,14 @@ func getApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
 
 	for _, dataset := range datasets {
 		datasetsStr = append(datasetsStr, Map{
-			"label": dataset.Label,
-			"data":  dataset.Data,
+			"name": dataset.Label,
+			"data": dataset.Data,
 		})
 	}
 
 	chartData := ChartData{
-		"labels":   daysStr,
-		"datasets": datasetsStr,
+		"categories": daysStr,
+		"series":     datasetsStr,
 	}
 
 	result, encodeErr := json2.Marshal(chartData)
@@ -165,6 +235,66 @@ func getApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
 	}
 
 	io.WriteString(wr, string(result))
+}
+
+type Message struct {
+	Version string
+	Event   string
+	Data    interface{}
+}
+
+type ApiResponse struct {
+	Success bool
+	Data    interface{}
+}
+
+func handleImportApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
+	wr.Header().Set("Access-Control-Allow-Origin", "*")
+	wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	conn, err := amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
+	eh.FailOnError(err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	eh.FailOnError(err)
+
+	q, err := ch.QueueDeclare(
+		"events",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	eh.FailOnError(err)
+
+	body, err := json2.Marshal(Message{
+		Version: "1",
+		Event:   "api.apartments.import",
+	})
+	eh.FailOnError(err)
+
+	publishErr := ch.Publish(
+		"",
+		q.Name,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		},
+	)
+	eh.PanicOnError(publishErr)
+
+	response := ApiResponse{
+		Success: true,
+	}
+	json, jsonErr := json2.Marshal(response)
+	eh.FailOnError(jsonErr)
+
+	_, writeErr := io.WriteString(wr, string(json))
+	eh.FailOnError(writeErr)
 }
 
 func groupApartmentsByUrl(apartments []dto.Apartment) map[string][]dto.Apartment {
@@ -205,6 +335,12 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 	}
 
 	days := []time.Time{}
+	datasets := []dto.ApartmentDataset{}
+
+	if minDay == nil || maxDay == nil {
+		return days, datasets
+	}
+
 	loc, _ := time.LoadLocation("UTC")
 	currentDay := time.Date(minDay.Year(), minDay.Month(), minDay.Day(), 0, 0, 0, 0, loc)
 
@@ -217,14 +353,11 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 		currentDay = currentDay.AddDate(0, 0, 1)
 	}
 
-	datasets := []dto.ApartmentDataset{}
-
 	for _, apartments := range groupedApartments {
 		dataset := dto.ApartmentDataset{}
-		var dayPrice float64
-		var prevDayPrice float64
 
 		for _, day := range days {
+			var dayPrice float64
 
 			for _, apartment := range apartments {
 				if dataset.Label == "" {
@@ -240,11 +373,33 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 				}
 			}
 
-			if dayPrice > 0 {
-				dataset.Data = append(dataset.Data, dayPrice)
-				prevDayPrice = dayPrice
-			} else {
-				dataset.Data = append(dataset.Data, prevDayPrice)
+			dataset.Data = append(dataset.Data, dayPrice)
+		}
+
+		// set previous prices instead of zeros
+		var prevPrice float64
+		var price float64
+
+		for i := 0; i < len(dataset.Data); i++ {
+			price = dataset.Data[i]
+			if price == 0 && prevPrice > 0 {
+				dataset.Data[i] = prevPrice
+			}
+
+			if price > 0 {
+				prevPrice = price
+			}
+		}
+
+		prevPrice = 0
+		for i := len(dataset.Data) - 1; i > -1; i-- {
+			price = dataset.Data[i]
+			if price == 0 && prevPrice > 0 {
+				dataset.Data[i] = prevPrice
+			}
+
+			if price > 0 {
+				prevPrice = price
 			}
 		}
 

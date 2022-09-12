@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  api:
+    container_name: 'apartments_api'
+    build:
+      dockerfile: Dockerfile
+      context: .
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    networks:
+      - apartments_network
+
+networks:
+  apartments_network:
+    driver: bridge
+    external: true
