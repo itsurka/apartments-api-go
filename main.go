@@ -2,6 +2,7 @@ package main
 
 import (
 	json2 "encoding/json"
+	"errhlp"
 	"errors"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -10,10 +11,11 @@ import (
 	"io"
 	"itsurka/apartments-api/internal/dto"
 	"itsurka/apartments-api/internal/helpers/dbhelper"
-	eh "itsurka/apartments-api/internal/helpers/errhelper"
+	"itsurka/apartments-api/internal/helpers/qhelper"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -22,31 +24,44 @@ Rest API
 - GET http://localhost:8000/ping
 - GET http://localhost:8000/apartments
 - POST http://localhost:8000/apartments/import
+- GET ws://localhost:8000/ws
 */
 
+var queue *qhelper.Queue
+
 func main() {
+	initEnvVars()
 	runWebServer()
+	//testQueueMessage()
+
 	//apartments := getApartments(nil)
 	//groupedApartments := groupApartmentsByUrl(apartments)
 	//days, datasets := getChartData(groupedApartments)
-	//fmt.Println(days, datasets)
+	//log.Println(days, datasets)
+}
+
+func initEnvVars() {
+	err := godotenv.Load(".env")
+	errhlp.Fatal(err)
 }
 
 func runWebServer() {
+	apiMessageChannel := make(chan []byte)
+
 	http.HandleFunc("/ping", ping)
-	http.HandleFunc("/apartments", getApartmentsRequest)
-	http.HandleFunc("/apartments/import", handleImportApartmentsRequest)
-	http.HandleFunc("/websocket/message/send", sendWebsocketMessage)
+	http.HandleFunc("/apartments", handleApartmentsRequest)
+	http.HandleFunc("/apartments/import", handleImportApartmentsRequest(apiMessageChannel))
+	http.HandleFunc("/apartments/test_import", handleTestImportApartmentsRequest(apiMessageChannel))
+	http.HandleFunc("/ws", handleWebsocketRequest(apiMessageChannel))
 
 	err := http.ListenAndServe(":8000", nil)
 	if errors.Is(err, http.ErrServerClosed) {
-
-		fmt.Println("server closed")
+		log.Println("server closed")
 	} else if err != nil {
 		fmt.Printf("error starting server: %s\n", err)
 		os.Exit(1)
 	} else {
-		fmt.Println("server started")
+		log.Println("server started")
 	}
 }
 
@@ -58,9 +73,6 @@ func ping(wr http.ResponseWriter, request *http.Request) {
 }
 
 func getApartments(request *http.Request) []dto.Apartment {
-	err := godotenv.Load(".env")
-	eh.FailOnError(err)
-
 	dbConfig := dbhelper.DbConfig{
 		os.Getenv("DB_DRIVER"),
 		os.Getenv("DB_HOST"),
@@ -122,7 +134,7 @@ func getApartments(request *http.Request) []dto.Apartment {
 
 	var apartmentsCount int
 	countErr := db.QueryRow(countQuery).Scan(&apartmentsCount)
-	eh.FailOnError(countErr)
+	errhlp.Fatal(countErr)
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -204,7 +216,7 @@ func getApartments(request *http.Request) []dto.Apartment {
 type Map map[string]interface{}
 type ChartData map[string]interface{}
 
-func getApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
+func handleApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
 	wr.Header().Set("Access-Control-Allow-Origin", "*")
 	wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
@@ -250,53 +262,60 @@ type ApiResponse struct {
 	Data    interface{}
 }
 
-func handleImportApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
-	wr.Header().Set("Access-Control-Allow-Origin", "*")
-	wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+func handleImportApartmentsRequest(wsMessageChannel chan []byte) func(w http.ResponseWriter, r *http.Request) {
+	return func(wr http.ResponseWriter, request *http.Request) {
+		wr.Header().Set("Access-Control-Allow-Origin", "*")
+		wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	conn, err := amqp.Dial("amqp://guest:guest@rabbitmq:5672/")
-	eh.FailOnError(err)
-	defer conn.Close()
+		getQueue().Publish("apartments.pending", dto.QueueMessage{
+			Version: "1",
+			Event:   "api.apartments.import",
+		})
 
-	ch, err := conn.Channel()
-	eh.FailOnError(err)
+		response := ApiResponse{
+			Success: true,
+		}
+		json, jsonErr := json2.Marshal(response)
+		errhlp.Fatal(jsonErr)
 
-	q, err := ch.QueueDeclare(
-		"events",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	eh.FailOnError(err)
+		_, writeErr := io.WriteString(wr, string(json))
+		errhlp.Fatal(writeErr)
 
-	body, err := json2.Marshal(Message{
-		Version: "1",
-		Event:   "api.apartments.import",
-	})
-	eh.FailOnError(err)
-
-	publishErr := ch.Publish(
-		"",
-		q.Name,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
-	eh.PanicOnError(publishErr)
-
-	response := ApiResponse{
-		Success: true,
+		writeToWsMessageChannel(wsMessageChannel, "api.apartments.import.received")
 	}
-	json, jsonErr := json2.Marshal(response)
-	eh.FailOnError(jsonErr)
+}
 
-	_, writeErr := io.WriteString(wr, string(json))
-	eh.FailOnError(writeErr)
+func handleTestImportApartmentsRequest(wsMessageChannel chan []byte) func(w http.ResponseWriter, r *http.Request) {
+	return func(wr http.ResponseWriter, request *http.Request) {
+		wr.Header().Set("Access-Control-Allow-Origin", "*")
+		wr.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		getQueue().Publish("apartments.pending", dto.QueueMessage{
+			Version: "1",
+			Event:   "api.apartments.import.test",
+		})
+
+		response := ApiResponse{
+			Success: true,
+		}
+		json, jsonErr := json2.Marshal(response)
+		errhlp.Fatal(jsonErr)
+
+		_, writeErr := io.WriteString(wr, string(json))
+		errhlp.Fatal(writeErr)
+
+		writeToWsMessageChannel(wsMessageChannel, "api.apartments.test_import.received")
+	}
+}
+
+func writeToWsMessageChannel(wsMessageChannel chan []byte, event string) {
+	go func(wsMessageChannel chan []byte, event string) {
+		message, _ := json2.Marshal(WebsocketMessage{
+			Event: event,
+		})
+
+		wsMessageChannel <- message
+	}(wsMessageChannel, event)
 }
 
 func groupApartmentsByUrl(apartments []dto.Apartment) map[string][]dto.Apartment {
@@ -411,12 +430,32 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 	return days, datasets
 }
 
+var (
+	newline = []byte{'\n'}
+	space   = []byte{' '}
+)
+
+const (
+	// Time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 60 * time.Second
+
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = (pongWait * 9) / 10
+
+	// Maximum message size allowed from peer.
+	maxMessageSize = 512
+)
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
-
-var wsConn = websocket.Conn{}
 
 type WebsocketMessage struct {
 	Event string
@@ -424,28 +463,279 @@ type WebsocketMessage struct {
 	//Data interface{}
 }
 
-func sendWebsocketMessage(wr http.ResponseWriter, request *http.Request) {
-	conn, err := upgrader.Upgrade(wr, request, nil)
-	eh.FailOnError(err)
+func handleWebsocketRequest(apiMessageChannel chan []byte) func(w http.ResponseWriter, r *http.Request) {
+	return func(wr http.ResponseWriter, request *http.Request) {
+		log.Println("")
+		log.Println("")
+		log.Println("handle websocket request")
 
-	messageType, _, err := conn.NextReader()
-	eh.FailOnError(err)
-	w, err := conn.NextWriter(messageType)
-	eh.FailOnError(err)
+		wsMessageChannel := make(chan []byte)
+		log.Println("wsMessageChannel created", wsMessageChannel)
+		closeAmqp := make(chan bool)
+		close1 := make(chan bool)
+		rabbitMqConnChannel := make(chan *amqp.Connection)
+		closed := make(chan bool)
 
-	messageDataBytes, err := json2.Marshal(WebsocketMessage{
-		Event: "test",
-	})
-	eh.FailOnError(err)
+		conn, err := upgrader.Upgrade(wr, request, nil)
 
-	_, wsWriteErr := w.Write(messageDataBytes)
-	eh.FailOnError(wsWriteErr)
+		defer func(conn *websocket.Conn, closeAmqp chan bool, rabbitMqConnChannel chan *amqp.Connection, close1 chan bool) {
+			log.Println("handleWebsocketRequest defer")
+			<-rabbitMqConnChannel
+			log.Println("empty rabbitMqConnChannel")
+			closeAmqp <- true
+			log.Println("set closeAmqp flag")
+			errhlp.Fatal(conn.Close())
+			log.Println("close websocket connection")
+			close1 <- true
+			log.Println("close1 set")
+		}(conn, closeAmqp, rabbitMqConnChannel, close1)
 
-	json, jsonErr := json2.Marshal(ApiResponse{
-		Success: true,
-	})
-	eh.FailOnError(jsonErr)
+		errhlp.Fatal(err)
+		errhlp.Fatal(err)
+		conn.SetReadLimit(maxMessageSize)
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		conn.SetPongHandler(func(string) error { conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+		conn.SetCloseHandler(func(code int, text string) error {
+			log.Println("closing websocket connection", code, text)
+			go func() {
+				closed <- true
+				log.Println("connection closed")
+			}()
+			return errors.New(text)
+		})
 
-	_, writeErr := io.WriteString(wr, string(json))
-	eh.FailOnError(writeErr)
+		go readWebsocket(conn)
+		go sendPingToWebsocket(conn)
+
+		go createRabbitMqConnection(os.Getenv("RABBITMQ_URL"), rabbitMqConnChannel, closeAmqp)
+		go proxyApiToWebsocketMessageChannel(apiMessageChannel, wsMessageChannel, close1)
+		go proxyFromQueueToMessageChannel(rabbitMqConnChannel, wsMessageChannel)
+
+		go writeToWebsocketFromChannel(conn, wsMessageChannel)
+		go waitWebsocketCloseMessage(conn)
+
+		log.Println("waiting for websocket connection close")
+		<-closed
+		log.Println("app completed, websocket connection closed")
+
+		io.WriteString(wr, "{}")
+	}
+}
+
+func readWebsocket(conn *websocket.Conn) {
+	for {
+		mt, m, err := conn.ReadMessage()
+		log.Println("read message", mt, string(m), err)
+
+		if err != nil || mt == -1 {
+			return
+		}
+	}
+}
+
+func sendPingToWebsocket(conn *websocket.Conn) {
+	for {
+		time.Sleep(5 * time.Second)
+
+		conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			log.Println("ping message error", err)
+			return
+		}
+	}
+}
+
+func createRabbitMqConnection(url string, rabbitMqConnChannel chan *amqp.Connection, closeAmqp chan bool) {
+	for {
+		select {
+		case <-closeAmqp:
+			log.Println("rabbitMqConnChannel before close", rabbitMqConnChannel)
+			close(rabbitMqConnChannel)
+			return
+
+		default:
+			log.Println("rabbitmq: create connection")
+			conn, err := amqp.Dial(url)
+			errhlp.Panic(err)
+
+			rabbitMqConnChannel <- conn
+			log.Println("rabbitmq: connection sent to channel")
+
+			defer func(conn *amqp.Connection) {
+				errhlp.Panic(conn.Close())
+			}(conn)
+		}
+	}
+}
+
+func checkRabbitMqConnection(rabbitMqConnChannel chan *amqp.Connection) {
+	log.Println("rabbitmq: check connection")
+	for {
+		select {
+		case conn, ok := <-rabbitMqConnChannel:
+			log.Println("checkRabbitMqConnection conn and ok", conn, ok)
+		}
+	}
+}
+
+func createRabbitMqConnectionChannel(conn *amqp.Connection, connectionChannel chan *amqp.Connection) (*amqp.Channel, error) {
+	log.Println("rabbitmq: create connection channel")
+	ch, err := conn.Channel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	channel := ch
+	go func() {
+		for {
+			log.Println("rabbitmq: channel monitoring started")
+
+			reason, ok := <-channel.NotifyClose(make(chan *amqp.Error))
+			log.Printf("rabbitmq: channel closed. Reason: %v, ok: %v\n", reason, ok)
+
+			for {
+				time.Sleep(1 * time.Second)
+				conn := <-connectionChannel
+
+				if conn != nil {
+					ch, err := conn.Channel()
+					if err == nil {
+						log.Println("rabbitmq: channel reconnected")
+						channel = ch
+
+						//Non-blocking push new connection back to connectionChannel to chain new connection to other RabbitMQ channels
+						select {
+						case connectionChannel <- conn:
+						default:
+						}
+
+						break
+					}
+
+					log.Printf("rabbitmq: can't reconnect channel. Error: %v\n", err)
+				}
+			}
+		}
+	}()
+
+	return channel, nil
+}
+
+func writeToWebsocketFromChannel(ws *websocket.Conn, chanMessage chan []byte) {
+	log.Println("websocket: writer started")
+
+	defer func() {
+		log.Println("writeToWebsocketFromChannel done")
+	}()
+
+	for {
+		message, ok := <-chanMessage
+		if ok {
+			log.Println("websocket: write message", string(message))
+			writeMessageError := ws.WriteMessage(websocket.TextMessage, message)
+
+			if writeMessageError != nil {
+				isClose := strings.Index(writeMessageError.Error(), "close")
+				log.Println("websocket: write message error", writeMessageError, writeMessageError.Error() == "close sent", len(writeMessageError.Error()), isClose)
+
+				writer, writerErr := ws.NextWriter(websocket.TextMessage)
+				if writerErr != nil {
+					log.Println("writer error", writerErr)
+				} else {
+					_, writeMessageError = writer.Write(message)
+					log.Println("websocket: write message error 2", writeMessageError)
+				}
+			}
+		} else {
+			log.Println("websocket message channel closed")
+			return
+		}
+	}
+}
+
+func waitWebsocketCloseMessage(ws *websocket.Conn) {
+	log.Println("websocket: waiting for close message")
+
+	for {
+		messageType, message, messageErr := ws.ReadMessage()
+
+		switch messageType {
+		case -1, 8:
+			log.Printf("websocket: connection closed by client with code %d and error: %s", messageType, messageErr)
+			return
+		default:
+			log.Println("websocket: received message", string(message))
+		}
+	}
+}
+
+func proxyApiToWebsocketMessageChannel(apiMessageChannel chan []byte, wsMessageChannel chan []byte, close1 chan bool) {
+	defer func() {
+		log.Println("proxyApiToWebsocketMessageChannel done")
+	}()
+
+	for {
+		select {
+		case message, ok := <-apiMessageChannel:
+			if !ok {
+				return
+			}
+			wsMessageChannel <- message
+		case <-close1:
+			return
+		}
+	}
+}
+
+func proxyFromQueueToMessageChannel(rabbitMqConnChannel chan *amqp.Connection, wsMessageChannel chan []byte) {
+	log.Println("rabbitmq: consumer started")
+
+	defer func() {
+		log.Println("proxyFromQueueToMessageChannel done")
+	}()
+
+	for {
+		conn, ok := <-rabbitMqConnChannel
+		if !ok {
+			close(wsMessageChannel)
+			return
+		}
+
+		log.Println("rabbitmq: connection read from channel")
+
+		chanRabbitMQ, err := conn.Channel()
+		errhlp.Fatal(err)
+
+		log.Println("rabbitmq: channel connection ready")
+
+		messageDeliveryChannel, consumeErr := chanRabbitMQ.Consume(
+			"apartments.done",
+			"",
+			true,
+			false,
+			false,
+			false,
+			nil,
+		)
+		errhlp.Fatal(consumeErr)
+
+		for d := range messageDeliveryChannel {
+			log.Println("rabbitmq: read message", string(d.Body))
+			wsMessageChannel <- d.Body
+			log.Println("rabbitmq: message sent to channel")
+		}
+	}
+}
+
+func getQueue() *qhelper.Queue {
+	if queue != nil {
+		return queue
+	}
+
+	queue = &qhelper.Queue{
+		ConnString: os.Getenv("RABBITMQ_URL"),
+	}
+
+	return queue
 }
