@@ -10,8 +10,8 @@ import (
 
 type Queue struct {
 	ConnString string
-	Сonnection *amqp.Connection
-	Сhannel    *amqp.Channel
+	Connection *amqp.Connection
+	Channel    *amqp.Channel
 }
 
 func (q *Queue) Publish(queueName string, message dto.QueueMessage) {
@@ -21,7 +21,7 @@ func (q *Queue) Publish(queueName string, message dto.QueueMessage) {
 	body, err := json2.Marshal(message)
 	eh.FailOnError(err)
 
-	publishErr := q.Сhannel.Publish(
+	publishErr := q.Channel.Publish(
 		"",
 		amqpQueue.Name,
 		false,
@@ -38,7 +38,7 @@ func (q *Queue) Consume(queueName string) <-chan amqp.Delivery {
 	q.init()
 	amqpQueue := q.getQueue(queueName)
 
-	messages, err := q.Сhannel.Consume(
+	messages, err := q.Channel.Consume(
 		amqpQueue.Name,
 		"",
 		true,
@@ -53,9 +53,9 @@ func (q *Queue) Consume(queueName string) <-chan amqp.Delivery {
 }
 
 func (q *Queue) getQueue(queueName string) amqp.Queue {
-	amqpQueue, err := q.Сhannel.QueueDeclare(
+	amqpQueue, err := q.Channel.QueueDeclare(
 		queueName,
-		false,
+		true,
 		false,
 		false,
 		false,
@@ -72,23 +72,23 @@ func (q *Queue) init() {
 }
 
 func (q *Queue) initChannel() {
-	if q.Сhannel != nil {
+	if q.Channel != nil {
 		return
 	}
 
-	ch, err := q.Сonnection.Channel()
+	ch, err := q.Connection.Channel()
 	eh.FailOnError(err)
 
-	q.Сhannel = ch
+	q.Channel = ch
 }
 
 func (q *Queue) initConnection() {
-	if q.Сonnection != nil {
+	if q.Connection != nil {
 		return
 	}
 
 	conn, err := amqp.Dial(q.ConnString)
 	eh.FailOnError(err)
 
-	q.Сonnection = conn
+	q.Connection = conn
 }
