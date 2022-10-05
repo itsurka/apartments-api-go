@@ -20,3 +20,6 @@ Websocket connection is on
 ```shell
 http://api.apartmens.local:8000/ws
 ```
+
+## Issues
+1. Fix number of goroutines, close at time.
