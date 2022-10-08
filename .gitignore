@@ -20,3 +20,4 @@ pg_data
 rabbitmq_data
 
 .idea
+_local
