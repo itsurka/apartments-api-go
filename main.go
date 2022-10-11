@@ -23,9 +23,9 @@ import (
 /**
 Rest API
 - GET http://localhost:8000/ping?client_id=user1
-- GET http://localhost:8000/apartments
-- POST http://localhost:8000/apartments/import
-- GET ws://localhost:8000/ws
+- GET http://localhost:8000/apartments?client_id=user1
+- POST http://localhost:8000/apartments/import?client_id=user1
+- GET ws://localhost:8000/ws?client_id=user1
 */
 
 var app App
@@ -109,7 +109,6 @@ func onBeforeRequest(rw http.ResponseWriter, r *http.Request) {
 }
 
 func onAfterRequest(rw http.ResponseWriter, r *http.Request) {
-	log.Println("after request app", app)
 }
 
 func initWebClient(rw http.ResponseWriter, r *http.Request) {
@@ -133,9 +132,9 @@ func initWebClient(rw http.ResponseWriter, r *http.Request) {
 		id:                clientId,
 		step:              "init",
 		closeGoroutinesCh: make(chan bool, 100),
+		wsMessageCh:       make(chan []byte, 5),
 		apiMessageCh:      make(chan []byte, 5),
 	}
-	//app.webClients = append(app.webClients, client)
 
 	addClient(client)
 }
@@ -570,86 +569,43 @@ type WebsocketMessage struct {
 }
 
 func handleWebsocketRequest(rw http.ResponseWriter, r *http.Request) {
-	log.Println("=========================================")
-	log.Println("ws: new request")
-
 	client := getClientById(getClientId(r))
 	closed := make(chan bool)
 
-	log.Println("ws: client stat =1", client.step, client.goroutinesCnt)
-
 	if client.step == "active" || client.step == "closing" {
-		log.Println("step =1: ", client.step)
 		for client.step == "active" {
 			time.Sleep(time.Second)
 		}
-		log.Println("step =2: ", client.step)
 		for client.step == "closing" {
 			time.Sleep(time.Second)
 		}
-		log.Println("step =3: ", client.step)
-
-		// @todo amqp connection check after ws reconnection...
-
-		//if client.goroutinesCnt > 0 {
-		//	for i := 0; i < client.goroutinesCnt; i++ {
-		//		client.closeGoroutinesCh <- true
-		//	}
-		//}
-		//for {
-		//	log.Println("=============== closing prev connection...", client.step, client.goroutinesCnt)
-		//	//errhlp.Fatal(client.wsConn.Close())
-		//	time.Sleep(time.Second)
-		//
-		//	if client.step == "closed" || client.goroutinesCnt == 0 {
-		//		log.Println("=============== closing prev connection: step closed...")
-		//		time.Sleep(time.Second)
-		//		break
-		//	}
-		//
-		//	log.Println("ws: client stat on closing...", client.step, client.goroutinesCnt)
-		//}
 	}
 
-	log.Println("ws: client stat =2", client.step, client.goroutinesCnt)
+	log.Println("============= ws: new request")
 	client.step = "active"
 
 	wsConn, wsConnErr := upgrader.Upgrade(rw, r, nil)
 	errhlp.Fatal(wsConnErr)
 	wsConn.SetReadLimit(maxMessageSize)
-	//wsConn.SetReadDeadline(time.Now().Add(pongWait))
-	//wsConn.SetPongHandler(func(string) error { wsConn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 	wsConn.SetCloseHandler(func(code int, text string) error {
-		log.Println("ws: close handler called =1", code, text, "client", client.goroutinesCnt)
 		message := websocket.FormatCloseMessage(code, "")
 		wsConn.WriteControl(websocket.CloseMessage, message, time.Now().Add(writeWait))
-		log.Println("ws: close handler called =2")
 		closed <- true
-		log.Println("ws: close handler called =3")
 		return nil
 	})
 	client.wsConn = wsConn
-	log.Println("ws: client stat =3", client.step, client.goroutinesCnt)
 
 	go readWebsocket(client)
 	go proxyQueueToWebsocket(client)
-	go proxyApiToWebsocket(client)
-
-	log.Println("ws: client stat =4", client.step, client.goroutinesCnt)
+	go proxyMessagesToWebsocket(client)
 
 	<-closed
 
-	log.Println("ws: client stat =5 closed signal", client.step, client.goroutinesCnt)
-
 	for i := 0; i < client.goroutinesCnt; i++ {
-		log.Println("XXX set close signal closeGoroutinesCh")
 		client.closeGoroutinesCh <- true
 	}
 
 	client.step = "closing"
-	//log.Println("========== closing websocket...")
-	//errhlp.Fatal(wsConn.Close())
-	//log.Println("========== websocket closed!")
 
 	// waiting goroutines close
 	for {
@@ -664,7 +620,7 @@ func handleWebsocketRequest(rw http.ResponseWriter, r *http.Request) {
 
 	client.step = "closed"
 
-	log.Println("ws: client stat =6 closed func", client.step, client.goroutinesCnt)
+	log.Println("ws: closed func, client stat", client.step, client.goroutinesCnt)
 }
 
 func getAmqpConnection() *amqp.Connection {
@@ -685,7 +641,6 @@ func proxyQueueToWebsocket(client *WebClient) {
 	log.Println(">>>>> gr started: proxyQueueToWebsocket", client.goroutinesCnt)
 
 	queueName := "apartments.done"
-	//rabbitMqChan := getRabbitMqChannel(getAmqpConnection(), queueName)
 
 	t := time.NewTicker(2 * time.Second)
 
@@ -709,23 +664,16 @@ func proxyQueueToWebsocket(client *WebClient) {
 	}()
 
 	for {
-		//log.Println("rabbitmq: messageDeliveryChannel len is %d", len(messageDeliveryChannel))
-		//log.Println("rabbitmq: before select...")
 
 		select {
 		case <-client.closeGoroutinesCh:
 			return
-		//case <-rabbitMqChan.NotifyClose(chanConnErr):
-		//	rabbitMqChan = getRabbitMqChannel(amqpConn, queueName)
 		case message := <-messageDeliveryChannel:
 			log.Println("rabbitmq: read message", string(message.Body))
 			writeToWebsocket(client.wsConn, message.Body)
 			log.Println("rabbitmq: message sent to websocket")
 		case <-t.C:
-			//log.Println("rabbitmq: waiting...")
 		}
-
-		//log.Println("rabbitmq: after select...")
 	}
 }
 
@@ -762,14 +710,8 @@ func readWebsocket(client *WebClient) {
 		default:
 			mt, m, err := client.wsConn.ReadMessage()
 
-			//if len(m) > 0 && string(m) == "PING" {
-			//	log.Println("ws: new message", string(m))
-			//}
-
 			if mt == -1 || err != nil {
 				log.Println("ws: error message", mt, m, err, client.wsConn.RemoteAddr().String(), client.wsConn.LocalAddr().String(), &client.wsConn)
-				//<-client.closeGoroutinesCh
-				//return
 				time.Sleep(2 * time.Second)
 			}
 
@@ -780,32 +722,6 @@ func readWebsocket(client *WebClient) {
 		}
 	}
 }
-
-//func pingToWebsocket(conn *websocket.Conn, wsGoroutinesClose chan bool) {
-//	client.goroutinesCnt++
-//	log.Println("gr started: pingToWebsocket")
-//
-//	defer func() {
-//		wsGoroutines--
-//		wsGoroutineList = append(wsGoroutineList, "pingToWebsocket --deleted")
-//		log.Println("gr done: pingToWebsocket")
-//	}()
-//
-//	for {
-//		select {
-//		case <-wsGoroutinesClose:
-//			return
-//		default:
-//			time.Sleep(5 * time.Second)
-//
-//			conn.SetWriteDeadline(time.Now().Add(writeWait))
-//			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-//				log.Println("gr: pingToWebsocket error", err)
-//				return
-//			}
-//		}
-//	}
-//}
 
 func createRabbitMqConnection(url string, rabbitMqConnChannel chan *amqp.Connection, closeAmqp chan bool) {
 	defer func() {
@@ -843,73 +759,6 @@ func checkRabbitMqConnection(rabbitMqConnChannel chan *amqp.Connection) {
 	}
 }
 
-func createRabbitMqConnectionChannel(conn *amqp.Connection, connectionChannel chan *amqp.Connection) (*amqp.Channel, error) {
-	log.Println("rabbitmq: create connection channel")
-	ch, err := conn.Channel()
-
-	if err != nil {
-		return nil, err
-	}
-
-	channel := ch
-	go func() {
-		for {
-			log.Println("rabbitmq: channel monitoring started")
-
-			reason, ok := <-channel.NotifyClose(make(chan *amqp.Error))
-			log.Printf("rabbitmq: channel closed. Reason: %v, ok: %v\n", reason, ok)
-
-			for {
-				time.Sleep(1 * time.Second)
-				conn := <-connectionChannel
-
-				if conn != nil {
-					ch, err := conn.Channel()
-					if err == nil {
-						log.Println("rabbitmq: channel reconnected")
-						channel = ch
-
-						//Non-blocking push new connection back to connectionChannel to chain new connection to other RabbitMQ channels
-						select {
-						case connectionChannel <- conn:
-						default:
-						}
-
-						break
-					}
-
-					log.Printf("rabbitmq: can't reconnect channel. Error: %v\n", err)
-				}
-			}
-		}
-	}()
-
-	return channel, nil
-}
-
-func writeToWebsocketFromChannel(ws *websocket.Conn, chanMessage chan []byte) {
-	log.Println("ws: writer started")
-
-	defer func() {
-		log.Println("gr done: writeToWebsocketFromChannel")
-	}()
-
-	for {
-		message, ok := <-chanMessage
-		if ok {
-			log.Println("ws: write message", string(message))
-			writeMessageError := ws.WriteMessage(websocket.TextMessage, message)
-			if writeMessageError != nil {
-				log.Println("ws: write message error", writeMessageError)
-				return
-			}
-		} else {
-			log.Println("websocket message channel closed")
-			return
-		}
-	}
-}
-
 func writeToWebsocket(ws *websocket.Conn, message []byte) {
 	log.Println("ws: write message", string(message))
 	err := ws.WriteMessage(websocket.TextMessage, message)
@@ -934,32 +783,13 @@ func waitWebsocketCloseMessage(ws *websocket.Conn) {
 	}
 }
 
-//func proxyApiToWebsocketMessageChannel(apiMessageCh chan []byte, amqpConn *amqp.Connection) {
-//	defer func() {
-//		log.Println("gr done: proxyApiToWebsocketMessageChannel")
-//	}()
-//
-//	for {
-//		select {
-//		case message, ok := <-apiMessageCh:
-//			if !ok {
-//				close(wsMessageChannel)
-//				return
-//			}
-//			wsMessageChannel <- message
-//		case <-close1:
-//			return
-//		}
-//	}
-//}
-
-func proxyApiToWebsocket(client *WebClient) {
+func proxyMessagesToWebsocket(client *WebClient) {
 	client.goroutinesCnt++
-	log.Println(">>>>> gr started: proxyApiToWebsocket", client.goroutinesCnt)
+	log.Println(">>>>> gr started: proxyMessagesToWebsocket", client.goroutinesCnt)
 
 	defer func() {
 		client.goroutinesCnt--
-		log.Println("<<<<< gr done: proxyApiToWebsocket", client.goroutinesCnt)
+		log.Println("<<<<< gr done: proxyMessagesToWebsocket", client.goroutinesCnt)
 	}()
 
 	t := time.NewTicker(200 * time.Millisecond)
@@ -968,6 +798,11 @@ func proxyApiToWebsocket(client *WebClient) {
 		select {
 		case <-client.closeGoroutinesCh:
 			return
+		case message, ok := <-client.wsMessageCh:
+			if !ok {
+				return
+			}
+			writeToWebsocket(client.wsConn, message)
 		case message, ok := <-client.apiMessageCh:
 			if !ok {
 				return
