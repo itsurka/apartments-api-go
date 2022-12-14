@@ -1,6 +1,8 @@
 package dto
 
 type ApartmentDataset struct {
-	Label string
-	Data  []float64
+	Label    string
+	Url      string
+	ImageUrl string
+	Data     []float64
 }

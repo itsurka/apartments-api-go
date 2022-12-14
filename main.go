@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -42,6 +43,7 @@ type WebClient struct {
 }
 
 type App struct {
+	m          sync.RWMutex
 	webClients []*WebClient
 	amqpConn   *amqp.Connection
 	queue      *qhelper.Queue
@@ -86,6 +88,7 @@ func main() {
 
 func checkAppClients() {
 	for {
+		app.m.Lock()
 		for _, client := range app.webClients {
 			if client == nil {
 				continue
@@ -94,8 +97,22 @@ func checkAppClients() {
 			if client.wsPingAt != nil {
 				pt = strconv.Itoa(int(time.Now().Sub(*client.wsPingAt).Seconds())) + "s"
 			}
-			log.Printf("client %s: grs: %d, step %s, ping: %s, ws: %v, amqp conn/chan: %v/%v, amqp state: %s\n", client.id, client.goroutinesCnt, client.step, pt, &client.wsConn, &app.queue.Connection, &app.queue.Channel, !app.queue.Connection.IsClosed())
+			amqpConnClosed := true
+			var amqpConn *amqp.Connection
+			amqpConn = nil
+			if app.queue != nil && app.queue.Connection != nil {
+				amqpConn = app.queue.Connection
+				amqpConnClosed = app.queue.Connection.IsClosed()
+			}
+			var amqpChan *amqp.Channel
+			amqpChan = nil
+			if app.queue != nil && app.queue.Channel != nil {
+				amqpChan = app.queue.Channel
+			}
+
+			log.Printf("client %s: grs: %d, step %s, ping: %s, ws: %v, amqp conn/chan: %v/%v, amqp state: %s\n", client.id, client.goroutinesCnt, client.step, pt, &client.wsConn, &amqpConn, &amqpChan, !amqpConnClosed)
 		}
+		app.m.Unlock()
 
 		time.Sleep(10 * time.Second)
 	}
@@ -120,15 +137,12 @@ func initWebClient(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idx := slices.IndexFunc(app.webClients, func(webClient *WebClient) bool {
-		return webClient != nil && webClient.id == clientId
-	})
-
-	if idx > -1 {
+	client := getClientById(clientId)
+	if client != nil {
 		return
 	}
 
-	client := &WebClient{
+	client = &WebClient{
 		id:                clientId,
 		step:              "init",
 		closeGoroutinesCh: make(chan bool, 100),
@@ -144,6 +158,9 @@ func getClientId(r *http.Request) string {
 }
 
 func getClientById(clientId string) *WebClient {
+	app.m.Lock()
+	defer app.m.Unlock()
+
 	idx := slices.IndexFunc(app.webClients, func(webClient *WebClient) bool {
 		return webClient != nil && webClient.id == clientId
 	})
@@ -156,6 +173,9 @@ func getClientById(clientId string) *WebClient {
 }
 
 func addClient(client *WebClient) {
+	app.m.Lock()
+	defer app.m.Unlock()
+
 	for i, c := range app.webClients {
 		if c == nil {
 			app.webClients[i] = client
@@ -190,7 +210,9 @@ func getApartments(request *http.Request) []dto.Apartment {
 		"last_updated,page_views,seller_login,seller_phone,image_urls,to_char(created_at, 'YYYY-MM-DD') " +
 		"as created_at,updated_at,unavailable_from "
 	var query string
-	var countQuery string
+	var queryCount string
+	dateFrom := request.URL.Query().Get("date_from")
+	dateTo := request.URL.Query().Get("date_to")
 
 	priceChangerDirection := request.URL.Query().Get("price_changed")
 
@@ -214,30 +236,35 @@ func getApartments(request *http.Request) []dto.Apartment {
 			"                                    from ((select id, url, price_eur, created_at" +
 			"                                           from apartments" +
 			"                                           where price_eur > 0 and url = t.url" +
+			"                                           and created_at BETWEEN $1 AND $2" +
 			"                                           order by created_at asc limit 1)" +
 			"                                          UNION ALL" +
 			"                                          (select id, url, price_eur, created_at" +
 			"                                           from apartments" +
 			"                                           where price_eur > 0 and url = t.url" +
+			"                                           and created_at BETWEEN $1 AND $2" +
 			"                                           order by created_at desc limit 1)) t3) t2" +
-			"                              where t.price_eur " + sign + " t2.prev_price_eur and t2.prev_price_eur > 0)) " +
+			"                              where created_at BETWEEN $1 AND $2 AND t.price_eur " + sign + " t2.prev_price_eur and t2.prev_price_eur > 0)) " +
+			"AND created_at BETWEEN $1 AND $2 " +
 			"ORDER BY id ASC"
 
-		countQuery = "SELECT COUNT(sq.id) FROM (" + query + ") sq"
+		queryCount = "SELECT COUNT(sq.id) FROM (" + query + ") sq"
 
 	default:
 		query = querySelect +
 			"FROM apartments " +
+			"WHERE created_at BETWEEN $1 AND $2 " +
 			"ORDER BY id ASC"
 
-		countQuery = "SELECT COUNT(id) FROM apartments"
+		queryCount = "SELECT COUNT(id) FROM (" + query + ") sq"
 	}
 
 	var apartmentsCount int
-	countErr := db.QueryRow(countQuery).Scan(&apartmentsCount)
+	countErr := db.QueryRow(queryCount, dateFrom, dateTo).Scan(&apartmentsCount)
 	errhlp.Fatal(countErr)
 
-	rows, err := db.Query(query)
+	log.Println("query, dateFrom, dateTo", query, dateFrom, dateTo)
+	rows, err := db.Query(query, dateFrom, dateTo)
 	if err != nil {
 		panic(err)
 	}
@@ -335,7 +362,9 @@ func handleApartmentsRequest(wr http.ResponseWriter, request *http.Request) {
 	for _, dataset := range datasets {
 		datasetsStr = append(datasetsStr, Map{
 			"name": dataset.Label,
+			"url":  dataset.Url,
 			"data": dataset.Data,
+			"img":  dataset.ImageUrl,
 		})
 	}
 
@@ -479,6 +508,7 @@ func getChartData(groupedApartments map[string][]dto.Apartment) ([]time.Time, []
 			for _, apartment := range apartments {
 				if dataset.Label == "" {
 					dataset.Label = apartment.Title
+					dataset.Url = apartment.URL
 				}
 
 				date, _ := time.Parse("2006-01-02", apartment.CreatedAt)
